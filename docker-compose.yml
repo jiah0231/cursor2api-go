@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  cursor2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cursor2api-go:latest
+    container_name: cursor2api
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    environment:
+      - PORT=8002
+      - DEBUG=false
+      - API_KEY=${API_KEY:-0000}
+      - MODELS=${MODELS:-gpt-5,gpt-4o,claude-3.5-sonnet,claude-4-sonnet,gemini-2.5-pro,deepseek-r1}
+      - TIMEOUT=${TIMEOUT:-30}
+      - MAX_INPUT_LENGTH=${MAX_INPUT_LENGTH:-200000}
+      - SYSTEM_PROMPT_INJECT=${SYSTEM_PROMPT_INJECT:-}
+      - USER_AGENT=${USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36}
+      - SCRIPT_URL=${SCRIPT_URL:-https://cursor.com/149e9513-01fa-4fb0-aad4-566afd725d1b/2d206a39-8ed7-437e-a3be-862e0f06eea3/a-4-a/c.js?i=0&v=3&h=cursor.com}
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

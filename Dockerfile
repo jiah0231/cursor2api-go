@@ -1,7 +1,6 @@
 # 构建阶段
 FROM golang:1.22-alpine AS builder
 
-# 设置工作目录
 WORKDIR /app
 
 # 安装必要的包
@@ -20,27 +19,24 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o cursor2api-go .
 
 # 运行阶段
-FROM alpine:latest
+FROM node:20-alpine
 
-# 安装ca-certificates
-RUN apk --no-cache add ca-certificates
+# 安装必要的工具
+RUN apk --no-cache add ca-certificates wget
 
-# 创建非root用户
-RUN adduser -D -g '' appuser
-
-WORKDIR /root/
+WORKDIR /app
 
 # 从构建阶段复制二进制文件
 COPY --from=builder /app/cursor2api-go .
 
+# 复制jscode文件（必须）
+COPY --from=builder /app/jscode ./jscode
+
 # 复制静态文件
 COPY --from=builder /app/static ./static
 
-# 更改所有者
-RUN chown -R appuser:appuser /root/
-
-# 切换到非root用户
-USER appuser
+# 复制环境变量示例
+COPY --from=builder /app/.env.example ./.env.example
 
 # 暴露端口
 EXPOSE 8002
