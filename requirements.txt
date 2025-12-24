@@ -1,0 +1,22 @@
+# Cursor2API Python - Dependencies
+# Web Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+
+# HTTP Client
+httpx==0.26.0
+
+# Environment & Config
+python-dotenv==1.0.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# Utilities
+uuid6==2024.1.12
+
+# SSE Support
+sse-starlette==1.8.2
+
+# Static files
+aiofiles==23.2.1
+

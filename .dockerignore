@@ -2,34 +2,39 @@
 .git
 .gitignore
 
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv
+ENV
+
 # IDE
 .idea
 .vscode
 *.swp
 *.swo
 
-# Build artifacts
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-cursor2api-go
-
-# Test
-*_test.go
-coverage.out
-
-# Docker
-Dockerfile
-docker-compose.yml
-.dockerignore
-
-# Documentation
+# Docs
 *.md
 !README.md
 
-# Misc
+# Docker
+Dockerfile
+docker-compose*.yml
+
+# Environment
 .env
+.env.*
+!env.sample
+
+# Tests
+tests
+*.test.py
+
+# Misc
 .DS_Store
-Thumbs.db
+*.log
