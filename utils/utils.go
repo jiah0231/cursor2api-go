@@ -11,9 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -259,7 +256,7 @@ func CreateHTTPClient(timeout time.Duration) *http.Client {
 	}
 }
 
-// ReadSSEStream 读取SSE流
+// ReadSSEStream 读取SSE流 (保留用于兼容性)
 func ReadSSEStream(ctx context.Context, resp *http.Response, output chan<- interface{}) error {
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -373,50 +370,4 @@ func ReadRequestBody(r *http.Request) ([]byte, error) {
 	}
 
 	return body, nil
-}
-
-// RunJS 执行JavaScript代码并返回标准输出内容
-func RunJS(jsCode string) (string, error) {
-	// 创建临时目录
-	tempDir, err := os.MkdirTemp("", "cursor_js_*")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temp dir: %w", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	// 创建JavaScript文件
-	jsFilePath := filepath.Join(tempDir, "script.js")
-	file, err := os.Create(jsFilePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to create js file: %w", err)
-	}
-
-	// 添加crypto模块导入并设置为全局变量
-	jsContent := `const crypto = require('crypto').webcrypto;
-global.crypto = crypto;
-globalThis.crypto = crypto;
-// 在Node.js环境中创建window对象
-if (typeof window === 'undefined') { global.window = global; }
-window.crypto = crypto;
-this.crypto = crypto;
-` + jsCode
-
-	if _, err := file.WriteString(jsContent); err != nil {
-		file.Close()
-		return "", fmt.Errorf("failed to write js content: %w", err)
-	}
-	file.Close()
-
-	// 执行Node.js命令
-	cmd := exec.Command("node", jsFilePath)
-	output, err := cmd.Output()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("node.js execution failed (exit code: %d)\nSTDOUT:\n%s\nSTDERR:\n%s",
-				exitErr.ExitCode(), string(output), string(exitErr.Stderr))
-		}
-		return "", fmt.Errorf("failed to execute node.js: %w", err)
-	}
-
-	return strings.TrimSpace(string(output)), nil
 }

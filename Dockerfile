@@ -18,25 +18,25 @@ COPY . .
 # 构建应用
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o cursor2api-go .
 
-# 运行阶段
-FROM node:20-alpine
+# 运行阶段 - 使用轻量级 Alpine 镜像（无需 Node.js）
+FROM alpine:3.19
 
 # 安装必要的工具
-RUN apk --no-cache add ca-certificates wget
+RUN apk --no-cache add ca-certificates wget tzdata
+
+# 设置时区
+ENV TZ=Asia/Shanghai
 
 WORKDIR /app
 
 # 从构建阶段复制二进制文件
 COPY --from=builder /app/cursor2api-go .
 
-# 复制jscode文件（必须）
-COPY --from=builder /app/jscode ./jscode
-
 # 复制静态文件
 COPY --from=builder /app/static ./static
 
 # 复制环境变量示例
-COPY --from=builder /app/.env.example ./.env.example
+COPY --from=builder /app/env.sample ./env.sample
 
 # 暴露端口
 EXPOSE 8002

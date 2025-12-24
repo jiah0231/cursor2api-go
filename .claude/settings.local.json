@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(gh search repos \"cursor api openai\" --limit 10)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(dir /b)",
+      "WebFetch(domain:news.ycombinator.com)",
+      "Bash(claude --version)"
+    ]
+  }
+}

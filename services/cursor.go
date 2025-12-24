@@ -1,97 +1,78 @@
 package services
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"cursor2api-go/config"
 	"cursor2api-go/middleware"
 	"cursor2api-go/models"
-	"cursor2api-go/utils"
-	"encoding/json"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/cookiejar"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/imroc/req/v3"
 	"github.com/sirupsen/logrus"
 )
 
-const cursorAPIURL = "https://cursor.com/api/chat"
+const (
+	cursorStreamChatPath = "/aiserver.v1.AiService/StreamChat"
+)
 
-// CursorService handles interactions with Cursor API.
+// CursorService handles interactions with Cursor IDE API via gRPC-Web.
 type CursorService struct {
 	config *config.Config
 	client *req.Client
-	mainJS string
-	envJS  string
 }
 
 // NewCursorService creates a new service instance.
 func NewCursorService(cfg *config.Config) *CursorService {
-	mainJS, err := os.ReadFile(filepath.Join("jscode", "main.js"))
-	if err != nil {
-		logrus.Fatalf("failed to read jscode/main.js: %v", err)
-	}
-
-	envJS, err := os.ReadFile(filepath.Join("jscode", "env.js"))
-	if err != nil {
-		logrus.Fatalf("failed to read jscode/env.js: %v", err)
-	}
-
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		logrus.Warnf("failed to create cookie jar: %v", err)
-	}
-
 	client := req.C()
 	client.SetTimeout(time.Duration(cfg.Timeout) * time.Second)
 	client.ImpersonateChrome()
-	if jar != nil {
-		client.SetCookieJar(jar)
-	}
 
 	return &CursorService{
 		config: cfg,
 		client: client,
-		mainJS: string(mainJS),
-		envJS:  string(envJS),
 	}
 }
 
 // ChatCompletion creates a chat completion stream for the given request.
 func (s *CursorService) ChatCompletion(ctx context.Context, request *models.ChatCompletionRequest) (<-chan interface{}, error) {
-	truncatedMessages := s.truncateMessages(request.Messages)
-	cursorMessages := models.ToCursorMessages(truncatedMessages, s.config.SystemPromptInject)
-
-	payload := models.CursorRequest{
-		Context:  []interface{}{},
-		Model:    request.Model,
-		ID:       utils.GenerateRandomString(16),
-		Messages: cursorMessages,
-		Trigger:  "submit-message",
+	// Validate token
+	if s.config.CursorToken == "" {
+		return nil, middleware.NewCursorWebError(http.StatusUnauthorized, "CURSOR_TOKEN is not configured")
 	}
 
-	jsonPayload, err := json.Marshal(payload)
+	// Build protobuf request
+	protoData, err := s.buildProtobufRequest(request)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal cursor payload: %w", err)
+		return nil, fmt.Errorf("failed to build protobuf request: %w", err)
 	}
 
-	xIsHuman, err := s.fetchXIsHuman(ctx)
-	if err != nil {
-		return nil, err
-	}
+	// Build gRPC-Web envelope (5-byte header + protobuf data)
+	envelope := s.buildGRPCWebEnvelope(protoData)
 
+	// Generate trace ID
+	traceID := uuid.New().String()
+
+	// Build headers
+	headers := s.buildHeaders(traceID)
+
+	// Make request
+	apiURL := s.config.CursorAPIURL + cursorStreamChatPath
 	resp, err := s.client.R().
 		SetContext(ctx).
-		SetHeaders(s.chatHeaders(xIsHuman)).
-		SetBody(jsonPayload).
+		SetHeaders(headers).
+		SetBody(envelope).
 		DisableAutoReadResponse().
-		Post(cursorAPIURL)
+		Post(apiURL)
 	if err != nil {
 		return nil, fmt.Errorf("cursor request failed: %w", err)
 	}
@@ -100,73 +81,216 @@ func (s *CursorService) ChatCompletion(ctx context.Context, request *models.Chat
 		body, _ := io.ReadAll(resp.Response.Body)
 		resp.Response.Body.Close()
 		message := strings.TrimSpace(string(body))
-		if strings.Contains(message, "Attention Required! | Cloudflare") {
-			message = "Cloudflare 403"
+		if message == "" {
+			message = fmt.Sprintf("HTTP %d", resp.StatusCode)
 		}
 		return nil, middleware.NewCursorWebError(resp.StatusCode, message)
 	}
 
 	output := make(chan interface{}, 32)
-	go s.consumeSSE(ctx, resp.Response, output)
+	go s.consumeGRPCWebStream(ctx, resp.Response, output)
 	return output, nil
 }
 
-func (s *CursorService) consumeSSE(ctx context.Context, resp *http.Response, output chan interface{}) {
-	defer close(output)
+// buildProtobufRequest builds a protobuf request from OpenAI format
+func (s *CursorService) buildProtobufRequest(request *models.ChatCompletionRequest) ([]byte, error) {
+	// Convert OpenAI messages to Cursor protobuf format
+	messages := make([]*ChatMessage, 0, len(request.Messages))
+	msgUUID := uuid.New().String()
 
-	if err := utils.ReadSSEStream(ctx, resp, output); err != nil {
-		if errors.Is(err, context.Canceled) {
+	for _, msg := range request.Messages {
+		role := uint64(1) // user
+		if msg.Role == "assistant" || msg.Role == "system" {
+			role = 2
+		}
+
+		content := msg.GetStringContent()
+		if s.config.SystemPromptInject != "" && msg.Role == "system" {
+			content = content + "\n" + s.config.SystemPromptInject
+		}
+
+		messages = append(messages, &ChatMessage{
+			Message: content,
+			Role:    role,
+			Uuid:    msgUUID,
+		})
+	}
+
+	// Build request
+	conversationID := uuid.New().String()
+	traceID := uuid.New().String()
+
+	req := &ChatRequest{
+		Message:        messages,
+		Unknown:        []byte{},
+		Paths:          s.config.CursorWorkingDir,
+		Model:          &ModelInfo{Model: request.Model, Unknown: []byte{}},
+		TraceId:        traceID,
+		Unknown1:       0,
+		Unknown2:       0,
+		ConversationId: conversationID,
+		Unknown4:       1,
+		Unknown5:       0,
+		Unknown6:       0,
+		Unknown7:       0,
+		Unknown8:       0,
+	}
+
+	return req.Marshal()
+}
+
+// buildGRPCWebEnvelope builds a gRPC-Web envelope with 5-byte length prefix
+func (s *CursorService) buildGRPCWebEnvelope(data []byte) []byte {
+	// gRPC-Web format: 1-byte compression flag + 4-byte big-endian length + data
+	length := len(data)
+	envelope := make([]byte, 5+length)
+	envelope[0] = 0 // no compression
+	binary.BigEndian.PutUint32(envelope[1:5], uint32(length))
+	copy(envelope[5:], data)
+	return envelope
+}
+
+// buildHeaders builds HTTP headers for the Cursor API request
+func (s *CursorService) buildHeaders(traceID string) map[string]string {
+	headers := map[string]string{
+		"User-Agent":                "connect-es/1.6.1",
+		"Authorization":             "Bearer " + s.config.CursorToken,
+		"connect-accept-encoding":   "gzip,br",
+		"connect-protocol-version":  "1",
+		"Content-Type":              "application/grpc-web+proto",
+		"x-amzn-trace-id":           "Root=" + traceID,
+		"x-cursor-client-version":   s.config.CursorVersion,
+		"x-cursor-timezone":         s.config.CursorTimezone,
+		"x-ghost-mode":              fmt.Sprintf("%t", s.config.CursorGhostMode),
+		"x-request-id":              traceID,
+	}
+
+	if s.config.CursorClientKey != "" {
+		headers["x-client-key"] = s.config.CursorClientKey
+	}
+
+	if s.config.CursorChecksum != "" {
+		headers["x-cursor-checksum"] = s.config.CursorChecksum
+	}
+
+	return headers
+}
+
+// consumeGRPCWebStream reads and parses gRPC-Web stream response
+func (s *CursorService) consumeGRPCWebStream(ctx context.Context, resp *http.Response, output chan interface{}) {
+	defer close(output)
+	defer resp.Body.Close()
+
+	buffer := make([]byte, 0)
+	chunk := make([]byte, 4096)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		n, err := resp.Body.Read(chunk)
+		if n > 0 {
+			buffer = append(buffer, chunk[:n]...)
+
+			// Parse gRPC-Web chunks from buffer
+			for {
+				text, consumed, parseErr := s.parseGRPCWebChunk(buffer)
+				if parseErr != nil {
+					logrus.WithError(parseErr).Debug("Failed to parse gRPC-Web chunk")
+					break
+				}
+				if consumed == 0 {
+					break
+				}
+
+				buffer = buffer[consumed:]
+
+				if text != "" {
+					select {
+					case output <- text:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}
+
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			logrus.WithError(err).Error("Error reading gRPC-Web stream")
+			errResp := middleware.NewCursorWebError(http.StatusBadGateway, err.Error())
+			select {
+			case output <- errResp:
+			default:
+			}
 			return
 		}
-		errResp := middleware.NewCursorWebError(http.StatusBadGateway, err.Error())
-		select {
-		case output <- errResp:
-		default:
-			logrus.WithError(err).Warn("failed to push SSE error to channel")
-		}
 	}
 }
 
-func (s *CursorService) fetchXIsHuman(ctx context.Context) (string, error) {
-	resp, err := s.client.R().
-		SetContext(ctx).
-		SetHeaders(s.scriptHeaders()).
-		Get(s.config.ScriptURL)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch script: %w", err)
+// parseGRPCWebChunk parses a single gRPC-Web chunk and extracts text content
+func (s *CursorService) parseGRPCWebChunk(buffer []byte) (string, int, error) {
+	// gRPC-Web chunk format: delimiter (00 00 00 00) + length info + data
+	// Based on the reverse engineering from nekohy/Cursor project
+
+	delimiter := []byte{0x00, 0x00, 0x00, 0x00}
+	delimiterIdx := bytes.Index(buffer, delimiter)
+
+	if delimiterIdx == -1 || len(buffer) < delimiterIdx+7 {
+		return "", 0, nil // Need more data
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		message := strings.TrimSpace(resp.String())
-		return "", middleware.NewCursorWebError(resp.StatusCode, message)
+	// Check if we have enough bytes after delimiter
+	if len(buffer) < delimiterIdx+4+3 {
+		return "", 0, nil // Need more data
 	}
 
-	scriptBody := resp.Bytes()
-	compiled := s.prepareJS(string(scriptBody))
-	value, err := utils.RunJS(compiled)
-	if err != nil {
-		return "", fmt.Errorf("failed to execute JS: %w", err)
+	byte1 := buffer[delimiterIdx+4]
+	byte2 := buffer[delimiterIdx+5]
+	byte3 := buffer[delimiterIdx+6]
+
+	// Validate: byte2 should be 0x0A and byte1-2 should equal byte3
+	if byte2 != 0x0A {
+		// Skip this delimiter and continue searching
+		return "", delimiterIdx + 1, nil
 	}
 
-	logrus.WithField("length", len(value)).Debug("Fetched x-is-human token")
+	if int(byte1)-2 != int(byte3) {
+		// Skip this delimiter and continue searching
+		return "", delimiterIdx + 1, nil
+	}
 
-	return value, nil
+	length := int(byte3)
+	chunkStart := delimiterIdx + 7
+	chunkEnd := chunkStart + length
+
+	if len(buffer) < chunkEnd {
+		return "", 0, nil // Need more data
+	}
+
+	text := string(buffer[chunkStart:chunkEnd])
+	return text, chunkEnd, nil
 }
 
-func (s *CursorService) prepareJS(cursorJS string) string {
-	replacer := strings.NewReplacer(
-		"$$currentScriptSrc$$", s.config.ScriptURL,
-		"$$UNMASKED_VENDOR_WEBGL$$", s.config.FP.UNMASKED_VENDOR_WEBGL,
-		"$$UNMASKED_RENDERER_WEBGL$$", s.config.FP.UNMASKED_RENDERER_WEBGL,
-		"$$userAgent$$", s.config.FP.UserAgent,
-	)
+// GenerateChecksum generates the x-cursor-checksum header value
+func GenerateChecksum(token string) string {
+	// The checksum format appears to be: hash1/hash2
+	// This is a simplified implementation - the actual algorithm may be more complex
+	hash1 := sha256.Sum256([]byte(token))
+	hash2 := sha256.Sum256([]byte(token + "cursor"))
 
-	mainScript := replacer.Replace(s.mainJS)
-	mainScript = strings.Replace(mainScript, "$$env_jscode$$", s.envJS, 1)
-	mainScript = strings.Replace(mainScript, "$$cursor_jscode$$", cursorJS, 1)
-	return mainScript
+	return hex.EncodeToString(hash1[:])[:64] + "/" + hex.EncodeToString(hash2[:])[:64]
 }
 
+// truncateMessages truncates messages to fit within max input length
 func (s *CursorService) truncateMessages(messages []models.Message) []models.Message {
 	if len(messages) == 0 || s.config.MaxInputLength <= 0 {
 		return messages
@@ -216,42 +340,254 @@ func (s *CursorService) truncateMessages(messages []models.Message) []models.Mes
 	return append(result, collected...)
 }
 
-func (s *CursorService) chatHeaders(xIsHuman string) map[string]string {
-	return map[string]string{
-		"User-Agent":                 s.config.FP.UserAgent,
-		"Content-Type":               "application/json",
-		"sec-ch-ua-platform":         `"Windows"`,
-		"x-path":                     "/api/chat",
-		"sec-ch-ua":                  `"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"`,
-		"x-method":                   "POST",
-		"sec-ch-ua-bitness":          `"64"`,
-		"sec-ch-ua-mobile":           "?0",
-		"sec-ch-ua-arch":             `"x86"`,
-		"x-is-human":                 xIsHuman,
-		"sec-ch-ua-platform-version": `"19.0.0"`,
-		"origin":                     "https://cursor.com",
-		"sec-fetch-site":             "same-origin",
-		"sec-fetch-mode":             "cors",
-		"sec-fetch-dest":             "empty",
-		"referer":                    "https://cursor.com/en-US/learn/how-ai-models-work",
-		"accept-language":            "zh-CN,zh;q=0.9,en;q=0.8",
-		"priority":                   "u=1, i",
-	}
+// Protobuf message types (embedded for simplicity - in production, use generated code)
+
+type ChatRequest struct {
+	Message        []*ChatMessage
+	Unknown        []byte
+	Paths          string
+	Model          *ModelInfo
+	TraceId        string
+	Unknown1       uint64
+	Unknown2       uint64
+	ConversationId string
+	Unknown4       uint64
+	Unknown5       uint64
+	Unknown6       uint64
+	Unknown7       uint64
+	Unknown8       uint64
 }
 
-func (s *CursorService) scriptHeaders() map[string]string {
-	return map[string]string{
-		"User-Agent":                 s.config.FP.UserAgent,
-		"sec-ch-ua-arch":             `"x86"`,
-		"sec-ch-ua-platform":         `"Windows"`,
-		"sec-ch-ua":                  `"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"`,
-		"sec-ch-ua-bitness":          `"64"`,
-		"sec-ch-ua-mobile":           "?0",
-		"sec-ch-ua-platform-version": `"19.0.0"`,
-		"sec-fetch-site":             "same-origin",
-		"sec-fetch-mode":             "no-cors",
-		"sec-fetch-dest":             "script",
-		"referer":                    "https://cursor.com/en-US/learn/how-ai-models-work",
-		"accept-language":            "zh-CN,zh;q=0.9,en;q=0.8",
+func (x *ChatRequest) ProtoMessage() {}
+
+func (x *ChatRequest) Reset() { *x = ChatRequest{} }
+
+func (x *ChatRequest) String() string { return fmt.Sprintf("%+v", x) }
+
+type ModelInfo struct {
+	Model   string
+	Unknown []byte
+}
+
+func (x *ModelInfo) ProtoMessage() {}
+
+func (x *ModelInfo) Reset() { *x = ModelInfo{} }
+
+func (x *ModelInfo) String() string { return fmt.Sprintf("%+v", x) }
+
+type ChatMessage struct {
+	Message string
+	Role    uint64
+	Uuid    string
+}
+
+func (x *ChatMessage) ProtoMessage() {}
+
+func (x *ChatMessage) Reset() { *x = ChatMessage{} }
+
+func (x *ChatMessage) String() string { return fmt.Sprintf("%+v", x) }
+
+// Manual protobuf encoding since we're not using protoc
+func (x *ChatRequest) Marshal() ([]byte, error) {
+	var buf bytes.Buffer
+
+	// Field 2: messages (repeated)
+	for _, msg := range x.Message {
+		msgBytes, err := msg.Marshal()
+		if err != nil {
+			return nil, err
+		}
+		buf.WriteByte(0x12) // field 2, wire type 2 (length-delimited)
+		writeVarint(&buf, uint64(len(msgBytes)))
+		buf.Write(msgBytes)
 	}
+
+	// Field 4: unknown bytes
+	if len(x.Unknown) > 0 {
+		buf.WriteByte(0x22) // field 4, wire type 2
+		writeVarint(&buf, uint64(len(x.Unknown)))
+		buf.Write(x.Unknown)
+	}
+
+	// Field 5: paths
+	if x.Paths != "" {
+		buf.WriteByte(0x2a) // field 5, wire type 2
+		writeVarint(&buf, uint64(len(x.Paths)))
+		buf.WriteString(x.Paths)
+	}
+
+	// Field 7: model
+	if x.Model != nil {
+		modelBytes, err := x.Model.Marshal()
+		if err != nil {
+			return nil, err
+		}
+		buf.WriteByte(0x3a) // field 7, wire type 2
+		writeVarint(&buf, uint64(len(modelBytes)))
+		buf.Write(modelBytes)
+	}
+
+	// Field 9: trace_id
+	if x.TraceId != "" {
+		buf.WriteByte(0x4a) // field 9, wire type 2
+		writeVarint(&buf, uint64(len(x.TraceId)))
+		buf.WriteString(x.TraceId)
+	}
+
+	// Field 13: unknown1
+	if x.Unknown1 != 0 {
+		buf.WriteByte(0x68) // field 13, wire type 0
+		writeVarint(&buf, x.Unknown1)
+	}
+
+	// Field 14: unknown2
+	if x.Unknown2 != 0 {
+		buf.WriteByte(0x70) // field 14, wire type 0
+		writeVarint(&buf, x.Unknown2)
+	}
+
+	// Field 15: conversation_id
+	if x.ConversationId != "" {
+		buf.WriteByte(0x7a) // field 15, wire type 2
+		writeVarint(&buf, uint64(len(x.ConversationId)))
+		buf.WriteString(x.ConversationId)
+	}
+
+	// Field 16: unknown4
+	if x.Unknown4 != 0 {
+		buf.WriteByte(0x80) // field 16
+		buf.WriteByte(0x01)
+		writeVarint(&buf, x.Unknown4)
+	}
+
+	// Field 22: unknown5
+	if x.Unknown5 != 0 {
+		buf.WriteByte(0xb0) // field 22
+		buf.WriteByte(0x01)
+		writeVarint(&buf, x.Unknown5)
+	}
+
+	// Field 24: unknown6
+	if x.Unknown6 != 0 {
+		buf.WriteByte(0xc0) // field 24
+		buf.WriteByte(0x01)
+		writeVarint(&buf, x.Unknown6)
+	}
+
+	// Field 28: unknown7
+	if x.Unknown7 != 0 {
+		buf.WriteByte(0xe0) // field 28
+		buf.WriteByte(0x01)
+		writeVarint(&buf, x.Unknown7)
+	}
+
+	// Field 29: unknown8
+	if x.Unknown8 != 0 {
+		buf.WriteByte(0xe8) // field 29
+		buf.WriteByte(0x01)
+		writeVarint(&buf, x.Unknown8)
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (x *ModelInfo) Marshal() ([]byte, error) {
+	var buf bytes.Buffer
+
+	// Field 1: model
+	if x.Model != "" {
+		buf.WriteByte(0x0a) // field 1, wire type 2
+		writeVarint(&buf, uint64(len(x.Model)))
+		buf.WriteString(x.Model)
+	}
+
+	// Field 4: unknown bytes
+	if len(x.Unknown) > 0 {
+		buf.WriteByte(0x22) // field 4, wire type 2
+		writeVarint(&buf, uint64(len(x.Unknown)))
+		buf.Write(x.Unknown)
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (x *ChatMessage) Marshal() ([]byte, error) {
+	var buf bytes.Buffer
+
+	// Field 1: message
+	if x.Message != "" {
+		buf.WriteByte(0x0a) // field 1, wire type 2
+		writeVarint(&buf, uint64(len(x.Message)))
+		buf.WriteString(x.Message)
+	}
+
+	// Field 2: role
+	if x.Role != 0 {
+		buf.WriteByte(0x10) // field 2, wire type 0
+		writeVarint(&buf, x.Role)
+	}
+
+	// Field 13: uuid
+	if x.Uuid != "" {
+		buf.WriteByte(0x6a) // field 13, wire type 2
+		writeVarint(&buf, uint64(len(x.Uuid)))
+		buf.WriteString(x.Uuid)
+	}
+
+	return buf.Bytes(), nil
+}
+
+func writeVarint(buf *bytes.Buffer, v uint64) {
+	for v >= 0x80 {
+		buf.WriteByte(byte(v) | 0x80)
+		v >>= 7
+	}
+	buf.WriteByte(byte(v))
+}
+
+// Re-implement buildProtobufRequest using manual marshaling
+func (s *CursorService) buildProtobufRequestManual(request *models.ChatCompletionRequest) ([]byte, error) {
+	// Convert OpenAI messages to Cursor protobuf format
+	messages := make([]*ChatMessage, 0, len(request.Messages))
+	msgUUID := uuid.New().String()
+
+	for _, msg := range request.Messages {
+		role := uint64(1) // user
+		if msg.Role == "assistant" || msg.Role == "system" {
+			role = 2
+		}
+
+		content := msg.GetStringContent()
+		if s.config.SystemPromptInject != "" && msg.Role == "system" {
+			content = content + "\n" + s.config.SystemPromptInject
+		}
+
+		messages = append(messages, &ChatMessage{
+			Message: content,
+			Role:    role,
+			Uuid:    msgUUID,
+		})
+	}
+
+	// Build request
+	conversationID := uuid.New().String()
+	traceID := uuid.New().String()
+
+	req := &ChatRequest{
+		Message:        messages,
+		Unknown:        []byte{},
+		Paths:          s.config.CursorWorkingDir,
+		Model:          &ModelInfo{Model: request.Model, Unknown: []byte{}},
+		TraceId:        traceID,
+		Unknown1:       0,
+		Unknown2:       0,
+		ConversationId: conversationID,
+		Unknown4:       1,
+		Unknown5:       0,
+		Unknown6:       0,
+		Unknown7:       0,
+		Unknown8:       0,
+	}
+
+	return req.Marshal()
 }
